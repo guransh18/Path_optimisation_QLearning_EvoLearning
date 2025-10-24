@@ -92,13 +92,18 @@ class Car:
         
         # Check if car would collide
         car_corners = get_car_corners(new_position, self.angle)
-        if all(point_in_polygon(tuple(corner), track_polygon) for corner in car_corners):
+        collision = not all(point_in_polygon(tuple(corner), track_polygon) for corner in car_corners)
+        
+        if not collision:
             self.position = new_position
         else:
             self.velocity = 0.0  # Stop car if any corner collides
 
         # Cast rays to detect walls
         self.cast_rays(track, point_in_polygon)
+        
+        # Return whether a collision occurred
+        return collision
 
     def cast_rays(self, track, point_in_polygon):
         """
@@ -168,8 +173,8 @@ class Car:
             self.ray_endpoints[i] = intersection_point
             
             # Print distance to terminal
-            print(f"{ray_names[i]} Ray: {min_distance:.2f} pixels", end="\t")
-        print()  # Newline after printing all ray distances
+            # print(f"{ray_names[i]} Ray: {min_distance:.2f} pixels", end="\t")
+        # print()  # Newline after printing all ray distances
 
     def draw(self, surface, colors):
         # Draw the car
