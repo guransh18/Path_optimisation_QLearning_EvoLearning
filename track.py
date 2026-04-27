@@ -333,6 +333,21 @@ class TrackGenerator:
                 pygame.draw.circle(surface, BLACK, (int(center_points[end_idx-1][0]), int(center_points[end_idx-1][1])), 7)
                 pygame.draw.circle(surface, color, (int(center_points[end_idx-1][0]), int(center_points[end_idx-1][1])), 5)
 
+
+
+
+
+
+
+
+# ==================================================TRACK CLASS==================================================
+
+
+
+
+
+
+
 class Track:
     def __init__(self, center_points=None, track_width=0):
         self.center_points = center_points or []
@@ -436,7 +451,39 @@ def render_debug_info(surface, track_gen, center_points):
     text_surface = font.render(controls_text, True, BLACK)
     surface.blit(text_surface, (10, HEIGHT - 40))
 
-# --- Main Program Loop ---
+
+# ===============================================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def main():
     global DEBUG_MODE

@@ -1,0 +1,892 @@
+NewTech.py code
+
+'''import os
+import numpy as np
+import pygame
+import math
+from collections import defaultdict
+from car import Car
+from Checkpoint import Checkpoint, draw_checkpoints, update_checkpoints, reset_checkpoints
+from NeuralNet import DQNAgent
+
+# ================================================================Spatial Grid==========================================================
+
+CELL_SIZE = 100  # tuneable
+CAR_LENGTH = 30
+CAR_RADIUS = 10 #Half width because capsule
+
+# Visualization toggles
+VISUALIZE_DEBUG = True
+
+
+def build_spatial_grid(segments, cell_size=CELL_SIZE):
+    """Build spatial grid for efficient collision/raycast queries. Run once."""
+    grid = defaultdict(list)
+
+    for i, (x1, y1, x2, y2) in enumerate(segments):
+        min_x, max_x = min(x1, x2), max(x1, x2)
+        min_y, max_y = min(y1, y2), max(y1, y2)
+
+        cx0 = int(min_x // cell_size)
+        cx1 = int(max_x // cell_size)
+        cy0 = int(min_y // cell_size)
+        cy1 = int(max_y // cell_size)
+
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                grid[(cx, cy)].append(i)
+
+    return grid
+
+def query_spatial_grid(grid, segments, x, y, radius, cell_size=CELL_SIZE):
+    """Query nearby segments within radius of point (x, y). Used every frame."""
+    cx = int(x // cell_size)
+    cy = int(y // cell_size)
+    r = int(math.ceil(radius / cell_size))
+
+    idx = set()
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            cell = (cx + dx, cy + dy)
+            if cell in grid:
+                idx.update(grid[cell])
+
+    if not idx:
+        return np.empty((0, 4))
+    return segments[list(idx)]
+
+def point_segment_dist_sq(px, py, x1, y1, x2, y2):
+    """Fast point to segment distance squared."""
+    vx, vy = x2 - x1, y2 - y1
+    wx, wy = px - x1, py - y1
+
+    c1 = vx*wx + vy*wy
+    if c1 <= 0:
+        return (px - x1)**2 + (py - y1)**2
+
+    c2 = vx*vx + vy*vy
+    if c2 <= c1:
+        return (px - x2)**2 + (py - y2)**2
+
+    b = c1 / c2
+    bx, by = x1 + b*vx, y1 + b*vy
+    return (px - bx)**2 + (py - by)**2
+
+def get_car_front(position, angle, length):
+    x, y = position
+    fx = x + math.cos(angle) * (length / 2)
+    fy = y + math.sin(angle) * (length / 2)
+    return fx, fy
+
+
+def get_car_capsule(position, angle, length):
+    x, y = position
+    dx = math.cos(angle)
+    dy = math.sin(angle)
+
+    half = length / 2
+    ax = x - dx * half
+    ay = y - dy * half
+    bx = x + dx * half
+    by = y + dy * half
+
+    return ax, ay, bx, by
+
+
+def car_collides(position, angle, segments):
+    ax, ay, bx, by = get_car_capsule(position, angle, CAR_LENGTH)
+    r2 = CAR_RADIUS * CAR_RADIUS
+
+    for x1, y1, x2, y2 in segments:
+        if segment_segment_dist_sq(
+            ax, ay, bx, by,
+            x1, y1, x2, y2
+        ) < r2:
+            return True
+    return False
+
+
+def segments_intersect(x1,y1,x2,y2, x3,y3,x4,y4):
+    def orient(ax, ay, bx, by, cx, cy):
+        return (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
+
+    o1 = orient(x1,y1,x2,y2, x3,y3)
+    o2 = orient(x1,y1,x2,y2, x4,y4)
+    o3 = orient(x3,y3,x4,y4, x1,y1)
+    o4 = orient(x3,y3,x4,y4, x2,y2)
+
+    return (o1*o2 < 0) and (o3*o4 < 0)
+
+
+def point_segments_dist_sq(px, py, segments):
+    """Vectorized point to multiple segments distance squared."""
+    x1 = segments[:, 0]
+    y1 = segments[:, 1]
+    x2 = segments[:, 2]
+    y2 = segments[:, 3]
+
+    vx = x2 - x1
+    vy = y2 - y1
+
+    wx = px - x1
+    wy = py - y1
+
+    c1 = vx*wx + vy*wy
+    c2 = vx*vx + vy*vy
+
+    t = np.clip(c1 / c2, 0.0, 1.0)
+
+    projx = x1 + t * vx
+    projy = y1 + t * vy
+
+    dx = px - projx
+    dy = py - projy
+
+    return dx*dx + dy*dy
+
+
+def segment_segment_dist_sq(x1,y1,x2,y2, x3,y3,x4,y4):
+    # Early out: intersecting segments
+    if segments_intersect(x1,y1,x2,y2, x3,y3,x4,y4):
+        return 0.0
+
+    # Min of endpoint → opposite segment distances
+    return min(
+        point_segment_dist_sq(x1, y1, x3, y3, x4, y4),
+        point_segment_dist_sq(x2, y2, x3, y3, x4, y4),
+        point_segment_dist_sq(x3, y3, x1, y1, x2, y2),
+        point_segment_dist_sq(x4, y4, x1, y1, x2, y2)
+    )
+
+
+def raycast(ray_x, ray_y, ray_angle, max_dist=300):
+    """
+    Cast a ray from (ray_x, ray_y) in direction ray_angle.
+    Returns distance to nearest wall or max_dist if none hit.
+    Uses spatial grid for efficiency.
+    """
+    # Query nearby segments using the grid
+    nearby = query_spatial_grid(
+        wall_grid,
+        all_walls,
+        ray_x,
+        ray_y,
+        radius=RAY_QUERY_RADIUS
+    )
+    
+    if len(nearby) == 0:
+        return max_dist
+    
+    # Ray direction
+    ray_dx = math.cos(ray_angle)
+    ray_dy = math.sin(ray_angle)
+    
+    min_dist = max_dist
+    
+    for x1, y1, x2, y2 in nearby:
+        # Segment direction
+        seg_dx = x2 - x1
+        seg_dy = y2 - y1
+        
+        # Cross product for parallel check
+        denom = ray_dx * seg_dy - ray_dy * seg_dx
+        if abs(denom) < 1e-10:
+            continue  # parallel
+        
+        # Vector from ray origin to segment start
+        ox = x1 - ray_x
+        oy = y1 - ray_y
+        
+        # Parameters for intersection
+        t = (ox * seg_dy - oy * seg_dx) / denom  # ray parameter
+        u = (ox * ray_dy - oy * ray_dx) / denom  # segment parameter
+        
+        # Check if intersection is valid
+        if t > 0 and 0 <= u <= 1:
+            if t < min_dist:
+                min_dist = t
+    
+    return min_dist
+
+
+# Load track data
+segments = np.load("Track1_combined_segments.npy", allow_pickle=False)
+SCALE = 1.5
+segments = segments*SCALE
+outerwall = segments[:70]
+innerwall = segments[70:]
+
+centerline = 0.5 * (outerwall + innerwall)
+
+
+# Get starting position from centerline index 0
+start_segment = centerline[0]
+start_x = (start_segment[0] + start_segment[2]) / 2
+start_y = (start_segment[1] + start_segment[3]) / 2
+start_angle = math.atan2(start_segment[3] - start_segment[1], start_segment[2] - start_segment[0])
+
+
+# Population settings
+POPULATION_SIZE = 5
+CAR_COLOR_ALIVE = (0, 0, 255)
+CAR_COLOR_DEAD = (255, 0, 0)
+
+
+# Create the car population
+cars = [Car(position=(start_x, start_y), angle=start_angle) for _ in range(POPULATION_SIZE)]
+
+# Build spatial grid once (walls are static)
+all_walls = np.vstack([outerwall, innerwall])
+wall_grid = build_spatial_grid(all_walls)
+
+# Number of checkpoints to create (adjustable)
+NUM_CHECKPOINTS =30
+# Point system configuration
+INITIAL_POINTS = 100
+CHECKPOINT_REWARD = 100
+POINT_DECAY_RATE = 25  # Points lost per second
+
+# Training configuration
+TRAINING_MODE = True  # Set to False for manual control
+STATE_SIZE = 5  # velocity, steering, 3 ray distances
+ACTION_SIZE = 4  # W, A, S, D
+MODEL_SAVE_PATH = "Car_Agent_Data/car_agent.pth"
+TARGET_UPDATE_FREQ = 100  # Update target network every N episodes
+
+# Console metrics configuration
+CONSOLE_METRICS = True
+PRINT_EVERY_EPISODE = 1
+
+
+# Create checkpoints from centerline segments
+def create_checkpoints_from_centerline(centerline_segments, track_width=80, num_checkpoints=20):
+    """Create a fixed number of checkpoints evenly distributed along the centerline."""
+    checkpoints = []
+    
+    # Calculate total centerline length
+    total_length = 0
+    segment_lengths = []
+    for segment in centerline_segments:
+        length = math.hypot(segment[2] - segment[0], segment[3] - segment[1])
+        segment_lengths.append(length)
+        total_length += length
+    
+    # Calculate spacing between checkpoints
+    checkpoint_spacing = total_length / num_checkpoints
+    
+    # Place checkpoints at even distance intervals
+    current_distance = 0
+    checkpoint_index = 0
+    accumulated_length = 0
+    
+    for i, segment in enumerate(centerline_segments):
+        seg_length = segment_lengths[i]
+        seg_start_dist = accumulated_length
+        seg_end_dist = accumulated_length + seg_length
+        
+        # Check if any checkpoints should be placed within this segment
+        while checkpoint_index < num_checkpoints:
+            target_distance = checkpoint_index * checkpoint_spacing
+            
+            if target_distance < seg_start_dist:
+                checkpoint_index += 1
+                continue
+            
+            if target_distance > seg_end_dist:
+                break
+            
+            # Interpolate position within this segment
+            t = (target_distance - seg_start_dist) / seg_length if seg_length > 0 else 0
+            center_x = segment[0] + t * (segment[2] - segment[0])
+            center_y = segment[1] + t * (segment[3] - segment[1])
+            center_point = np.array([center_x, center_y])
+            
+            # Calculate direction along the segment
+            direction = np.array([segment[2] - segment[0], segment[3] - segment[1]])
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / norm
+            else:
+                direction = np.array([1.0, 0.0])
+            
+            # Create checkpoint with width to span the track
+            checkpoint = Checkpoint(center_point, direction, width=track_width * 1.5)
+            checkpoints.append(checkpoint)
+            checkpoint_index += 1
+        
+        accumulated_length = seg_end_dist
+    
+    print(f"Created {len(checkpoints)} checkpoints evenly distributed along {total_length:.1f} units of track")
+    return checkpoints
+
+# Estimate track width from inner and outer walls
+track_width = np.mean([np.linalg.norm(outerwall[i][:2] - innerwall[i][:2]) for i in range(min(len(outerwall), len(innerwall)))])
+checkpoints = create_checkpoints_from_centerline(centerline, track_width=track_width, num_checkpoints=NUM_CHECKPOINTS)
+
+CAR_COLLISION_RADIUS = 15  # for circle approximation
+CAR_QUERY_RADIUS = 30      # query radius for nearby segments
+RAY_QUERY_RADIUS = 300     # query radius for raycasting
+RAY_ANGLES = [
+    0.0,
+    math.radians(45),
+    math.radians(-45),
+    # math.radians(90),
+    # math.radians(-90),
+]
+
+# ================================================================Pygame==========================================================
+
+
+# Initialize pygame
+pygame.init()
+WIDTH, HEIGHT = 1280, 720
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+
+pygame.display.set_caption("Track Visualization")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont('Arial', 24)
+
+# Colors
+BLACK = (0, 0, 0)
+RED = (255, 0, 0)
+WHITE = (255, 255, 255)
+BLUE = (0, 0, 255)
+
+
+def draw_capsule(screen, ax, ay, bx, by, radius, color=(0, 255, 0)):
+    # Draw central axis (optional)  
+    pygame.draw.line(screen, color, (ax, ay), (bx, by), 2)
+
+    # Draw end circles
+    pygame.draw.circle(screen, color, (int(ax), int(ay)), radius, 2)
+    pygame.draw.circle(screen, color, (int(bx), int(by)), radius, 2)
+
+    # Draw side lines (connect the circles)
+    vx = bx - ax
+    vy = by - ay
+    length = math.hypot(vx, vy)
+
+    if length == 0:
+        return
+
+    nx = -vy / length
+    ny =  vx / length
+
+    # Offset points
+    p1 = (ax + nx * radius, ay + ny * radius)
+    p2 = (bx + nx * radius, by + ny * radius)
+    p3 = (bx - nx * radius, by - ny * radius)
+    p4 = (ax - nx * radius, ay - ny * radius)
+
+    pygame.draw.line(screen, color, p1, p2, 2)
+    pygame.draw.line(screen, color, p3, p4, 2)
+
+# Initialize point system (per car)
+current_points = [float(INITIAL_POINTS) for _ in range(POPULATION_SIZE)]
+checkpoints_passed = [0 for _ in range(POPULATION_SIZE)]
+current_checkpoint_index = [4 for _ in range(POPULATION_SIZE)]  # Index of the next checkpoint per car
+laps_completed = [0 for _ in range(POPULATION_SIZE)]
+
+# Initialize DQN Agents (one per car)
+agents = []
+for _ in range(POPULATION_SIZE):
+    agent = DQNAgent(
+        state_size=STATE_SIZE,
+        action_size=ACTION_SIZE,
+        hidden_size=16,
+        learning_rate=0.001,
+        gamma=0.99,
+        epsilon=1.0,
+        epsilon_min=0.01,
+        epsilon_decay=0.995,
+        memory_size=10000,
+        batch_size=64
+    )
+
+    agents.append(agent)
+
+# Training tracking variables
+episode_count = 0
+episode_rewards = [0.0 for _ in range(POPULATION_SIZE)]
+steps_in_episode = [0 for _ in range(POPULATION_SIZE)]
+prev_states = [None for _ in range(POPULATION_SIZE)]
+prev_actions = [None for _ in range(POPULATION_SIZE)]
+episode_points_history = [[] for _ in range(POPULATION_SIZE)]
+episode_time = [0.0 for _ in range(POPULATION_SIZE)]
+alive_flags = [True for _ in range(POPULATION_SIZE)]
+done_reasons = [None for _ in range(POPULATION_SIZE)]
+
+best_episode_max_points = -float('inf')
+best_episode_end_points = -float('inf')
+
+def print_population_metrics(episode_idx, points_histories, checkpoints_list, laps_list, done_reasons_list):
+    if not CONSOLE_METRICS:
+        return
+    if episode_idx % PRINT_EVERY_EPISODE != 0:
+        return
+
+    if len(points_histories) == 0:
+        print(f"Episode {episode_idx} finished. No population history recorded.")
+        return
+
+    end_points = []
+    max_points = []
+    for hist in points_histories:
+        if len(hist) == 0:
+            end_points.append(float('-inf'))
+            max_points.append(float('-inf'))
+        else:
+            end_points.append(float(hist[-1]))
+            max_points.append(float(max(hist)))
+
+    best_idx = int(np.argmax(end_points))
+    worst_idx = int(np.argmin(end_points))
+
+    best_reason = done_reasons_list[best_idx] or "unknown"
+    worst_reason = done_reasons_list[worst_idx] or "unknown"
+
+    print("\n=== Population Metrics ===")
+    print(f"Episode: {episode_idx}")
+    print(
+        f"Best Car -> Index: {best_idx} | End Points: {end_points[best_idx]:.1f} | Max Points: {max_points[best_idx]:.1f} | "
+        f"Checkpoints: {checkpoints_list[best_idx]} | Laps: {laps_list[best_idx]} | Reason: {best_reason}"
+    )
+    print(
+        f"Worst Car -> Index: {worst_idx} | End Points: {end_points[worst_idx]:.1f} | Max Points: {max_points[worst_idx]:.1f} | "
+        f"Checkpoints: {checkpoints_list[worst_idx]} | Laps: {laps_list[worst_idx]} | Reason: {worst_reason}"
+    )
+
+def get_state(car, ray_distances):
+    """Create state vector from car data and ray distances."""
+    # Normalize values for better learning
+    velocity_normalized = car.velocity / car.max_velocity  # -1 to 1
+    steering_normalized = car.steering / (car.steering_speed * car.turning_circle)  # -1 to 1
+    
+    # Normalize ray distances (0 to 1, where 1 is max distance)
+    rays_normalized = [d / RAY_QUERY_RADIUS for d in ray_distances]
+    
+    return [velocity_normalized, steering_normalized] + rays_normalized
+
+def reset_episode():
+    """Reset car and checkpoints for a new episode."""
+    global current_points, checkpoints_passed, current_checkpoint_index
+    global episode_rewards, steps_in_episode, prev_states, prev_actions
+    global episode_points_history, episode_time, alive_flags, done_reasons
+    
+    # Reset car positions
+    for car in cars:
+        car.position = np.array([start_x, start_y], dtype=float)
+        car.angle = start_angle
+        car.velocity = 0.0
+        car.steering = 0.0
+    
+    # Reset point system
+    current_points = [float(INITIAL_POINTS) for _ in range(POPULATION_SIZE)]
+    checkpoints_passed = [0 for _ in range(POPULATION_SIZE)]
+    current_checkpoint_index = [4 for _ in range(POPULATION_SIZE)]
+    
+    # Reset all checkpoints
+    reset_checkpoints(checkpoints)
+    
+    # Reset episode tracking
+    episode_rewards = [0.0 for _ in range(POPULATION_SIZE)]
+    steps_in_episode = [0 for _ in range(POPULATION_SIZE)]
+    prev_states = [None for _ in range(POPULATION_SIZE)]
+    prev_actions = [None for _ in range(POPULATION_SIZE)]
+    episode_points_history = [[] for _ in range(POPULATION_SIZE)]
+    episode_time = [0.0 for _ in range(POPULATION_SIZE)]
+    alive_flags = [True for _ in range(POPULATION_SIZE)]
+    done_reasons = [None for _ in range(POPULATION_SIZE)]
+
+# Main loop
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+    # Get keyboard input for WASD controls (or use agent in training mode)
+    keys_pressed = pygame.key.get_pressed()
+    dt = clock.get_time() / 1000.0
+    ray_distances = None
+    ray_origin = None
+    ray_angle_source = None
+    ray_debug = [None for _ in range(POPULATION_SIZE)]
+
+    for i, car in enumerate(cars):
+        if not alive_flags[i]:
+            continue
+
+        if TRAINING_MODE:
+            # First, get ray distances for current state (before action)
+            ray_origin_pre = get_car_front(car.position, car.angle, CAR_LENGTH)
+            ray_distances_pre = []
+            for offset in RAY_ANGLES:
+                dist = raycast(
+                    ray_origin_pre[0],
+                    ray_origin_pre[1],
+                    car.angle + offset,
+                    max_dist=RAY_QUERY_RADIUS
+                )
+                ray_distances_pre.append(dist)
+
+            # Get current state
+            current_state = get_state(car, ray_distances_pre)
+
+            # Select action from agent
+            action = agents[i].act(current_state, training=True)
+            keys = agents[i].get_action_keys(action)
+        else:
+            # Manual control
+            keys = {
+                'W': keys_pressed[pygame.K_w],
+                'A': keys_pressed[pygame.K_a],
+                'S': keys_pressed[pygame.K_s],
+                'D': keys_pressed[pygame.K_d]
+            }
+            action = None
+            current_state = None
+
+        # Store previous position for checkpoint detection
+        prev_position = car.position.copy()
+        prev_angle = car.angle
+
+        # Update car
+        car.update(keys)
+
+        # Update checkpoints (only check the next checkpoint in sequence)
+        checkpoint_passed = False
+        if current_checkpoint_index[i] < len(checkpoints):
+            current_checkpoint = checkpoints[current_checkpoint_index[i]]
+            passed = current_checkpoint.check_car_passage(car.position, car.angle, prev_position, prev_angle)
+
+            if passed:
+                current_points[i] += CHECKPOINT_REWARD
+                checkpoints_passed[i] += 1
+                current_checkpoint_index[i] += 1
+                checkpoint_passed = True
+
+                # Check if completed a lap
+                if current_checkpoint_index[i] >= len(checkpoints):
+                    laps_completed[i] += 1
+                    current_checkpoint_index[i] = 0
+                    # Reset all checkpoints for the next lap
+                    reset_checkpoints(checkpoints)
+
+        # Apply point decay
+        current_points[i] -= POINT_DECAY_RATE * dt
+        if TRAINING_MODE:
+            episode_time[i] += dt
+
+        # Calculate reward for training
+        step_reward = 0
+        done = False
+        done_reason = None
+
+        if TRAINING_MODE:
+            # Reward for passing checkpoint
+            if checkpoint_passed:
+                step_reward += CHECKPOINT_REWARD
+
+            # Small penalty for time (encourages speed)
+            step_reward -= POINT_DECAY_RATE * dt
+
+            # Reward for moving forward (velocity in direction of travel)
+            step_reward += car.velocity * 0.1
+
+        # Collision detection using spatial grid
+        nearby = query_spatial_grid(
+            wall_grid,
+            all_walls,
+            car.position[0],
+            car.position[1],
+            radius=CAR_QUERY_RADIUS
+        )
+
+        # --- Raycasting ---
+        ray_origin_local = get_car_front(car.position, car.angle, CAR_LENGTH)
+
+        ray_distances_local = []
+
+        for offset in RAY_ANGLES:
+            dist = raycast(
+                ray_origin_local[0],
+                ray_origin_local[1],
+                car.angle + offset,
+                max_dist=RAY_QUERY_RADIUS
+            )
+            ray_distances_local.append(dist)
+
+        ray_debug[i] = (ray_origin_local, car.angle, ray_distances_local)
+
+        if ray_distances is None:
+            ray_distances = ray_distances_local
+            ray_origin = ray_origin_local
+            ray_angle_source = car.angle
+
+        if car_collides(car.position, car.angle, nearby):
+            if TRAINING_MODE:
+                step_reward -= 100  # Large penalty for collision
+                done = True
+                done_reason = "collision"
+            else:
+                car.crash()  # or handle collision however you want
+        if current_points[i] < 0:
+            if TRAINING_MODE:
+                done = True
+                done_reason = "points_depleted"
+            else:
+                car.crash()  # or handle point depletion however you want
+
+        # Store experience and train (only in training mode)
+        if TRAINING_MODE and prev_states[i] is not None and prev_actions[i] is not None:
+            # Get next state
+            ray_origin_post = get_car_front(car.position, car.angle, CAR_LENGTH)
+            ray_distances_post = []
+            for offset in RAY_ANGLES:
+                dist = raycast(
+                    ray_origin_post[0],
+                    ray_origin_post[1],
+                    car.angle + offset,
+                    max_dist=RAY_QUERY_RADIUS
+                )
+                ray_distances_post.append(dist)
+            next_state = get_state(car, ray_distances_post)
+
+            # Store experience
+            agents[i].remember(prev_states[i], prev_actions[i], step_reward, next_state, done)
+
+            # Train the agent
+            agents[i].replay()
+
+            # Update episode reward
+            episode_rewards[i] += step_reward
+            steps_in_episode[i] += 1
+
+        # Update previous state and action for next iteration
+        if TRAINING_MODE:
+            prev_states[i] = current_state
+            prev_actions[i] = action
+
+        if TRAINING_MODE:
+            episode_points_history[i].append(current_points[i])
+
+        if done:
+            alive_flags[i] = False
+            done_reasons[i] = done_reason
+
+    # Handle episode end (all cars done)
+    if TRAINING_MODE and all(not flag for flag in alive_flags):
+        episode_count += 1
+        print_population_metrics(
+            episode_count,
+            points_histories=episode_points_history,
+            checkpoints_list=checkpoints_passed,
+            laps_list=laps_completed,
+            done_reasons_list=done_reasons
+        )
+
+        # Update best points across population
+        for hist in episode_points_history:
+            if len(hist) > 0:
+                best_episode_max_points = max(best_episode_max_points, max(hist))
+                best_episode_end_points = max(best_episode_end_points, hist[-1])
+        print(f"Best Max Points so far: {best_episode_max_points:.1f}")
+        print(f"Best End Points so far: {best_episode_end_points:.1f}")
+
+        # Update target networks periodically
+        if episode_count % TARGET_UPDATE_FREQ == 0:
+            for agent in agents:
+                agent.update_target_model()
+            print("Target networks updated!")
+
+        # Save models periodically
+        if episode_count % 50 == 0:
+            for idx, agent in enumerate(agents):
+                agent.save(f"car_agent_{idx}.pth")
+
+        # Reset for new episode
+        reset_episode()
+
+    # Clear screen
+    screen.fill(WHITE)
+
+    # Draw outer wall (black) - each segment is x1,y1,x2,y2
+    for segment in outerwall:
+        x1, y1, x2, y2 = segment.astype(int)
+        pygame.draw.line(screen, BLACK, (x1, y1), (x2, y2), 2)
+
+    # Draw inner wall (black) - each segment is x1,y1,x2,y2
+    for segment in innerwall:
+        x1, y1, x2, y2 = segment.astype(int)
+        pygame.draw.line(screen, BLACK, (x1, y1), (x2, y2), 2)
+
+    # Draw centerline (red) - each segment is x1,y1,x2,y2
+    for segment in centerline:
+        x1, y1, x2, y2 = segment.astype(int)
+        pygame.draw.line(screen, RED, (x1, y1), (x2, y2), 2)
+
+    # Draw checkpoints (highlight current checkpoint in green)
+    for i, checkpoint in enumerate(checkpoints):
+        if i == current_checkpoint_index:
+            # Draw current checkpoint in green
+            pygame.draw.line(
+                screen,
+                (0, 255, 0),  # Green
+                (int(checkpoint.point1[0]), int(checkpoint.point1[1])),
+                (int(checkpoint.point2[0]), int(checkpoint.point2[1])),
+                5  # Thicker line for visibility
+            )
+        else:
+            checkpoint.draw(screen)
+
+    # Draw the cars (alive=blue, dead=red)
+    for i, car in enumerate(cars):
+        color = CAR_COLOR_ALIVE if alive_flags[i] else CAR_COLOR_DEAD
+        car.draw(screen, color)
+
+    if VISUALIZE_DEBUG:
+        # Draw rays and capsule hitboxes for all cars
+        for i, data in enumerate(ray_debug):
+            if data is None:
+                continue
+            origin, angle, distances = data
+            for offset, dist in zip(RAY_ANGLES, distances):
+                ang = angle + offset
+                end_x = origin[0] + math.cos(ang) * dist
+                end_y = origin[1] + math.sin(ang) * dist
+
+                t = min(dist / RAY_QUERY_RADIUS, 1.0)
+                color = (
+                    int(255 * (1 - t)),  # red
+                    int(255 * t),        # green
+                    0
+                )
+                pygame.draw.line(screen, color, origin, (end_x, end_y), 2)
+                pygame.draw.circle(screen, (255, 80, 80), (int(end_x), int(end_y)), 3)
+
+            ax, ay, bx, by = get_car_capsule(cars[i].position, cars[i].angle, CAR_LENGTH)
+            draw_capsule(screen, ax, ay, bx, by, CAR_RADIUS, color=(0, 200, 0))
+
+        if ray_distances is not None and ray_origin is not None:
+            labels = ["Front", "R45", "L45", "R90", "L90"]
+            for i, (label, dist) in enumerate(zip(labels, ray_distances)):
+                txt = font.render(f"{label}: {dist:.1f}", True, BLACK)
+                screen.blit(txt, (10, 120 + i * 22))
+
+    # Display best car position and angle (by current points)
+    best_idx = int(np.argmax(current_points))
+    best_car = cars[best_idx]
+    car_x, car_y = best_car.position
+    car_angle_deg = math.degrees(best_car.angle) % 360  # Convert to degrees, normalize to 0-360
+    pos_text = font.render(f"Best Car Pos: ({car_x:.1f}, {car_y:.1f})", True, BLACK)
+    angle_text = font.render(f"Best Car Angle: {car_angle_deg:.1f}°", True, BLACK)
+    velocity_text = font.render(f"Best Car Velocity: {best_car.velocity:.2f}", True, BLACK)
+    screen.blit(pos_text, (10, 10))
+    screen.blit(angle_text, (10, 40))
+    screen.blit(velocity_text, (10, 70))
+    
+    # Display points (best/worst)
+    worst_idx = int(np.argmin(current_points))
+    best_points = current_points[best_idx]
+    worst_points = current_points[worst_idx]
+    points_color = (0, 150, 0) if best_points > 50 else (255, 165, 0) if best_points > 0 else RED
+    points_text = font.render(f"Best Points: {best_points:.1f}", True, points_color)
+    worst_points_text = font.render(f"Worst Points: {worst_points:.1f}", True, BLACK)
+    checkpoints_text = font.render(f"Best Checkpoints: {checkpoints_passed[best_idx]}/{len(checkpoints)}", True, BLACK)
+    laps_text = font.render(f"Best Laps: {laps_completed[best_idx]}", True, BLACK)
+    screen.blit(points_text, (10, 250))
+    screen.blit(worst_points_text, (10, 280))
+    screen.blit(checkpoints_text, (10, 310))
+    screen.blit(laps_text, (10, 340))
+    
+    # Display training info
+    if TRAINING_MODE:
+        episode_text = font.render(f"Episode: {episode_count}", True, BLACK)
+        avg_epsilon = float(np.mean([a.epsilon for a in agents])) if len(agents) > 0 else 0.0
+        avg_reward = float(np.mean(episode_rewards)) if len(episode_rewards) > 0 else 0.0
+        epsilon_text = font.render(f"Avg Epsilon: {avg_epsilon:.3f}", True, BLACK)
+        reward_text = font.render(f"Avg Episode Reward: {avg_reward:.1f}", True, BLACK)
+        mode_text = font.render("MODE: TRAINING", True, (255, 0, 0))
+        screen.blit(episode_text, (10, 370))
+        screen.blit(epsilon_text, (10, 400))
+        screen.blit(reward_text, (10, 430))
+        screen.blit(mode_text, (10, 460))
+    else:
+        mode_text = font.render("MODE: MANUAL", True, (0, 150, 0))
+        screen.blit(mode_text, (10, 370))
+
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
+
+
+# ================================================================Helper Functions=========================================================='''
+
+
+car.py code - 
+
+# import numpy as np
+# import math
+# import pygame
+
+# class Car:
+#     def __init__(self, position, angle=0.0, turning_circle=3):
+#         """
+#         Initialize the car at a given position and angle.
+#         Args:
+#             position: (x, y) tuple for car's starting position
+#             angle: initial orientation in radians
+#         """
+#         self.position = np.array(position, dtype=float)
+#         self.angle = angle
+#         self.velocity = 0.0
+#         self.steering = 0.0
+#         self.max_velocity = 10.0
+#         self.acceleration = 0.5
+#         self.friction = 0.025
+#         self.steering_speed = 0.075
+#         self.turning_circle = turning_circle
+
+#     def update(self, keys):
+#         """
+#         Update car position based on WASD controls.
+#         Args:
+#             keys: dict with 'W', 'A', 'S', 'D' boolean values
+#         """
+#         # WASD controls
+#         if keys.get('W', False):
+#             self.velocity += self.acceleration
+#         if keys.get('S', False):
+#             self.velocity -= self.acceleration
+#         self.velocity *= (1 - self.friction)
+#         self.velocity = max(-self.max_velocity, min(self.velocity, self.max_velocity))
+
+#         if keys.get('A', False):
+#             self.steering = -self.steering_speed * self.turning_circle
+#         elif keys.get('D', False):
+#             self.steering = self.steering_speed * self.turning_circle
+#         else:
+#             self.steering = 0.0
+
+#         # Update car angle based on steering and velocity
+#         self.angle += self.steering * (self.velocity / self.max_velocity)
+
+#         # Calculate new position
+#         direction = np.array([math.cos(self.angle), math.sin(self.angle)])
+#         self.position = self.position + direction * self.velocity
+
+#     def draw(self, surface, color=(0, 0, 255)):
+#         """
+#         Draw the car on the given surface.
+#         Args:
+#             surface: pygame surface to draw on
+#             color: RGB tuple for car color (default blue)
+#         """
+#         car_length, car_width = 40, 20
+#         car_surf = pygame.Surface((car_length, car_width), pygame.SRCALPHA)
+#         pygame.draw.rect(car_surf, color, car_surf.get_rect())
+#         rotated = pygame.transform.rotate(car_surf, -math.degrees(self.angle))
+#         rect = rotated.get_rect(center=self.position)
+#         surface.blit(rotated, rect)

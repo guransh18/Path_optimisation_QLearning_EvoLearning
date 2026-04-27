@@ -249,73 +249,6 @@ def get_point_at_distance(center_points, target_distance):
     # Fallback if there are not enough points
     return np.array(center_points[0]), np.array([1.0, 0.0])
 
-def create_checkpoints(track, spacing=None, width_factor=1.5, target_count=30, start_offset=50):
-    """
-    Create evenly spaced checkpoints along the track based on distance.
-    
-    Args:
-        track: The track object containing center_points
-        spacing: Number of points to skip between checkpoints (ignored in distance-based approach)
-        width_factor: Factor to multiply track width for checkpoint width
-        target_count: Target number of checkpoints
-        start_offset: Distance from start position to place the first checkpoint
-        
-    Returns:
-        List of Checkpoint objects
-    """
-    checkpoints = []
-    
-    if not track.center_points or len(track.center_points) < 2:
-        return checkpoints
-    
-    # Calculate track length
-    track_length = calculate_track_length(track.center_points)
-    
-    # Calculate checkpoint spacing based on track length and target count
-    distance_spacing = track_length / target_count
-    
-    # Calculate approximate track width if not defined
-    if hasattr(track, 'track_width') and track.track_width > 0:
-        track_width = track.track_width
-    else:
-        # Estimate track width from inner and outer walls
-        if track.inner_wall and track.outer_wall and len(track.inner_wall) > 0:
-            # Sample a few points to estimate width
-            sample_count = min(10, len(track.inner_wall))
-            sample_indices = [int(i * len(track.inner_wall) / sample_count) for i in range(sample_count)]
-            
-            widths = []
-            for i in sample_indices:
-                inner_point = np.array(track.inner_wall[i])
-                outer_point = np.array(track.outer_wall[i])
-                widths.append(np.linalg.norm(outer_point - inner_point))
-            
-            track_width = np.mean(widths)
-        else:
-            # Default width if we can't calculate
-            track_width = 80
-    
-    # Calculate checkpoint width
-    checkpoint_width = track_width * width_factor
-    
-    # Create checkpoints at equal distance intervals with an offset from the start
-    for i in range(target_count):
-        # Add start_offset to the target distance
-        target_distance = i * distance_spacing + start_offset
-        
-        # Handle the case where target_distance exceeds track length by wrapping around
-        target_distance = target_distance % track_length
-        
-        point, direction = get_point_at_distance(track.center_points, target_distance)
-        
-        # Create checkpoint at this position
-        checkpoint = Checkpoint(point, direction, checkpoint_width)
-        checkpoints.append(checkpoint)
-    
-    # Print diagnostic info
-    print(f"Created {len(checkpoints)} checkpoints evenly spaced along track length {track_length:.1f}")
-    
-    return checkpoints
 
 
 def update_checkpoints(car, checkpoints, car_prev_position=None, car_prev_angle=None):
@@ -348,3 +281,51 @@ def reset_checkpoints(checkpoints):
     """Reset all checkpoints to not passed state"""
     for checkpoint in checkpoints:
         checkpoint.reset()
+
+def create_checkpoints_from_centerline(centerline_segs, track_width, spacing_pixels=120, width_factor=1.5, start_offset=150):
+    """
+    Creates equidistant perpendicular checkpoints based on physical distance.
+    """
+    checkpoints = []
+    if len(centerline_segs) < 2:
+        return checkpoints
+
+    pts = [np.array(centerline_segs[0, :2])]
+    for i in range(len(centerline_segs)):
+        pts.append(np.array(centerline_segs[i, 2:4]))
+    
+    track_length = 0
+    distances = [0]
+    for i in range(len(pts)-1):
+        dist = np.linalg.norm(pts[i+1] - pts[i])
+        track_length += dist
+        distances.append(track_length)
+
+    # --- THE RELATIVE DISTANCE MATH ---
+    # Figure out roughly how many checkpoints fit into the track
+    target_count = max(5, int(track_length // spacing_pixels))
+    
+    # Recalculate the exact spacing so they are perfectly even and close the loop
+    actual_spacing = track_length / target_count
+    checkpoint_width = track_width * width_factor
+
+    for i in range(target_count):
+        target_dist = (i * actual_spacing + start_offset) % track_length
+        
+        for j in range(len(distances)-1):
+            if distances[j] <= target_dist <= distances[j+1]:
+                p1 = pts[j]
+                p2 = pts[j+1]
+                segment_len = distances[j+1] - distances[j]
+                
+                if segment_len == 0: continue
+                    
+                fraction = (target_dist - distances[j]) / segment_len
+                point = p1 + fraction * (p2 - p1)
+                direction = (p2 - p1) / segment_len
+                
+                cp = Checkpoint(point, direction, checkpoint_width)
+                checkpoints.append(cp)
+                break
+    
+    return checkpoints
